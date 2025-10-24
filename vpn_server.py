@@ -5,7 +5,7 @@ from crypto_utils import CryptoHandler, print_separator
 
 
 class VPNClient:
-    def __init__(self, server_host='localhost', server_port=8000):
+    def __init__(self, server_host='localhost', server_port=5001):
         self.server_host = server_host
         self.server_port = server_port
         self.client_socket = None
