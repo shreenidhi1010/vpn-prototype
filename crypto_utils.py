@@ -4,8 +4,8 @@ from cryptography.hazmat.primitives.asymmetric import rsa, padding
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.backends import default_backend
- 
- 
+
+
 class CryptoHandler:
     def __init__(self):
         self.private_key = None
@@ -113,8 +113,8 @@ class CryptoHandler:
         plaintext = decryptor.update(ciphertext) + decryptor.finalize()
         
         return plaintext.decode('utf-8')
- 
- 
+
+
 def print_separator(title=""):
     """Print a formatted separator for console output"""
     print("\n" + "="*60)
