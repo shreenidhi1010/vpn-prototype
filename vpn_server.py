@@ -4,164 +4,136 @@ import sys
 from crypto_utils import CryptoHandler, print_separator
 
 
-class VPNServer:
-    def __init__(self, host='0.0.0.0', port=8000):
-        self.host = host
-        self.port = port
-        self.server_socket = None
-        self.clients = []
+class VPNClient:
+    def __init__(self, server_host='localhost', server_port=8000):
+        self.server_host = server_host
+        self.server_port = server_port
+        self.client_socket = None
+        self.crypto = CryptoHandler()
         
-    def start(self):
-        """Start the VPN server"""
-        print_separator("VPN SERVER STARTING")
+    def connect(self):
+        """Connect to the VPN server and establish secure tunnel"""
+        print_separator("VPN CLIENT STARTING")
         
-        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.crypto.generate_rsa_keys()
         
         try:
-            self.server_socket.bind((self.host, self.port))
-            self.server_socket.listen(5)
-            print(f"[+] Server listening on {self.host}:{self.port}")
-            print("[+] Waiting for client connections...")
+            self.client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.client_socket.connect((self.server_host, self.server_port))
+            print(f"[+] Connected to server at {self.server_host}:{self.server_port}")
+            
+            print_separator("SECURE TUNNEL ESTABLISHMENT")
+            
+            client_public_key = self.crypto.get_public_key_bytes()
+            self.client_socket.send(client_public_key)
+            print("[+] Sent public key to server")
+            
+            server_public_key = self.client_socket.recv(4096)
+            self.crypto.load_peer_public_key(server_public_key)
+            print("[+] Received public key from server")
+            
+            key_length_bytes = self.client_socket.recv(4)
+            key_length = int.from_bytes(key_length_bytes, byteorder='big')
+            
+            encrypted_aes_key = b''
+            while len(encrypted_aes_key) < key_length:
+                chunk = self.client_socket.recv(min(4096, key_length - len(encrypted_aes_key)))
+                if not chunk:
+                    break
+                encrypted_aes_key += chunk
+            
+            print("[+] Received encrypted AES key from server")
+            
+            self.crypto.decrypt_aes_key_with_rsa(encrypted_aes_key)
+            
+            self.client_socket.send(b'ACK')
+            print("[+] Secure tunnel established successfully!")
             print_separator()
+            print("\n[*] You can now send encrypted messages to the server")
+            print("[*] Type your messages below (or 'quit' to disconnect):\n")
             
-            while True:
-                client_socket, client_address = self.server_socket.accept()
-                print(f"\n[+] New connection from {client_address}")
-                
-                client_thread = threading.Thread(
-                    target=self.handle_client,
-                    args=(client_socket, client_address)
-                )
-                client_thread.daemon = True
-                client_thread.start()
-                self.clients.append(client_socket)
-                
-        except KeyboardInterrupt:
-            print("\n[!] Server shutting down...")
-            self.shutdown()
+            receive_thread = threading.Thread(target=self.receive_messages)
+            receive_thread.daemon = True
+            receive_thread.start()
+            
+            self.send_messages()
+            
+        except ConnectionRefusedError:
+            print(f"[!] Connection refused. Is the server running at {self.server_host}:{self.server_port}?")
         except Exception as e:
-            print(f"[!] Server error: {e}")
-            self.shutdown()
+            print(f"[!] Connection error: {e}")
+        finally:
+            self.disconnect()
     
-    def handle_client(self, client_socket, client_address):
-        """Handle individual client connection"""
-        client_crypto = CryptoHandler()
-        
-        try:
-            print_separator(f"SECURE TUNNEL ESTABLISHMENT - {client_address}")
-            
-            client_crypto.generate_rsa_keys()
-            
-            client_public_key = client_socket.recv(4096)
-            client_crypto.load_peer_public_key(client_public_key)
-            print(f"[+] Received public key from {client_address}")
-            
-            server_public_key = client_crypto.get_public_key_bytes()
-            client_socket.send(server_public_key)
-            print(f"[+] Sent public key to {client_address}")
-            
-            aes_key = client_crypto.generate_aes_key()
-            encrypted_aes_key = client_crypto.encrypt_aes_key_with_rsa(aes_key)
-            
-            key_length = len(encrypted_aes_key).to_bytes(4, byteorder='big')
-            client_socket.send(key_length)
-            client_socket.send(encrypted_aes_key)
-            print(f"[+] Sent encrypted AES key to {client_address}")
-            
-            ack = client_socket.recv(1024)
-            if ack == b'ACK':
-                print("[+] Secure tunnel established successfully!")
-                print_separator()
-                print(f"\n[*] Ready to receive encrypted messages from {client_address}")
-                print("[*] Type your messages below (or 'quit' to disconnect):\n")
-                
-                receive_thread = threading.Thread(
-                    target=self.receive_messages,
-                    args=(client_socket, client_address, client_crypto)
-                )
-                receive_thread.daemon = True
-                receive_thread.start()
-                
-                self.send_messages(client_socket, client_address, client_crypto)
-            else:
-                print("[!] Failed to establish secure tunnel")
-                client_socket.close()
-                
-        except Exception as e:
-            print(f"[!] Error handling client {client_address}: {e}")
-            client_socket.close()
-    
-    def receive_messages(self, client_socket, client_address, client_crypto):
-        """Receive and decrypt messages from client"""
+    def receive_messages(self):
+        """Receive and decrypt messages from server"""
         while True:
             try:
-                length_bytes = client_socket.recv(4)
+                if self.client_socket is None:
+                    break
+                length_bytes = self.client_socket.recv(4)
                 if not length_bytes:
                     break
-                    
+                
                 message_length = int.from_bytes(length_bytes, byteorder='big')
                 encrypted_message = b''
                 
                 while len(encrypted_message) < message_length:
-                    chunk = client_socket.recv(min(4096, message_length - len(encrypted_message)))
+                    chunk = self.client_socket.recv(min(4096, message_length - len(encrypted_message)))
                     if not chunk:
                         break
                     encrypted_message += chunk
                 
                 if encrypted_message:
-                    decrypted_message = client_crypto.decrypt_message(encrypted_message)
-                    print(f"\n[Client {client_address}] {decrypted_message}")
-                    print("[Server] ", end='', flush=True)
+                    decrypted_message = self.crypto.decrypt_message(encrypted_message)
+                    print(f"\n[Server] {decrypted_message}")
+                    print("[Client] ", end='', flush=True)
                     
             except Exception as e:
-                print(f"\n[!] Error receiving message from {client_address}: {e}")
+                print(f"\n[!] Error receiving message: {e}")
                 break
     
-    def send_messages(self, client_socket, client_address, client_crypto):
-        """Send encrypted messages to client"""
+    def send_messages(self):
+        """Send encrypted messages to server"""
         while True:
             try:
-                message = input(f"[Server to {client_address}] ")
+                message = input("[Client] ")
                 
                 if message.lower() == 'quit':
-                    print(f"[!] Disconnecting from {client_address}...")
-                    client_socket.close()
+                    print("[!] Disconnecting from server...")
                     break
                 
-                if message:
-                    encrypted_message = client_crypto.encrypt_message(message)
+                if message and self.client_socket is not None:
+                    encrypted_message = self.crypto.encrypt_message(message)
                     
                     message_length = len(encrypted_message).to_bytes(4, byteorder='big')
-                    client_socket.send(message_length)
-                    client_socket.send(encrypted_message)
+                    self.client_socket.send(message_length)
+                    self.client_socket.send(encrypted_message)
                     
             except Exception as e:
-                print(f"[!] Error sending message to {client_address}: {e}")
+                print(f"[!] Error sending message: {e}")
                 break
     
-    def shutdown(self):
-        """Shutdown the server"""
-        for client in self.clients:
-            try:
-                client.close()
-            except:
-                pass
-        
-        if self.server_socket:
-            self.server_socket.close()
-        
-        print("[+] Server shutdown complete")
+    def disconnect(self):
+        """Disconnect from the server"""
+        if self.client_socket:
+            self.client_socket.close()
+        print("[+] Disconnected from server")
         sys.exit(0)
 
 
 if __name__ == "__main__":
     print("""
     ╔════════════════════════════════════════════════════════════╗
-    ║          VPN PROTOTYPE - SECURE TUNNEL SERVER              ║
+    ║          VPN PROTOTYPE - SECURE TUNNEL CLIENT              ║
     ║    Demonstrating RSA Key Exchange & AES-256 Encryption     ║
     ╚════════════════════════════════════════════════════════════╝
     """)
     
-    server = VPNServer()
-    server.start()
+    print("\n[*] Enter server details:")
+    host = input("Server host (press Enter for localhost): ").strip() or "localhost"
+    port_input = input("Server port (press Enter for 8000): ").strip()
+    port = int(port_input) if port_input else 8000
+    
+    client = VPNClient(server_host=host, server_port=port)
+    client.connect()
