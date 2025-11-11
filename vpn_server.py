@@ -1,106 +1,154 @@
+# vpn_server.py
 import socket
 import threading
+import struct
 import sys
-from crypto_utils import print_separator
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.backends import default_backend
+import os
 
-class VPNServer:
-    def __init__(self, host='0.0.0.0', port=8000):
-        self.host = host
-        self.port = port
-        self.server_socket = None
-        self.clients = {}  # {client_socket: (address, public_key)}
+HOST = '0.0.0.0'
+PORT = 8000
 
-    def start(self):
-        """Start VPN server and accept multiple clients"""
-        print_separator("VPN SERVER STARTING")
-        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+# helpers for length-prefixed messaging
+def recv_exact(conn, n):
+    data = b''
+    while len(data) < n:
+        chunk = conn.recv(n - len(data))
+        if not chunk:
+            return None
+        data += chunk
+    return data
 
+def recv_msg(conn):
+    hdr = recv_exact(conn, 4)
+    if not hdr:
+        return None
+    length = int.from_bytes(hdr, byteorder='big')
+    return recv_exact(conn, length)
+
+def send_msg(conn, payload: bytes):
+    conn.sendall(len(payload).to_bytes(4, byteorder='big') + payload)
+
+# derive AES-256 key from ECDH shared secret using HKDF-SHA256
+def derive_aes_key(shared_secret: bytes) -> bytes:
+    hkdf = HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=None,
+        info=b'vpn-ecdh-session',
+        backend=default_backend()
+    )
+    return hkdf.derive(shared_secret)
+
+# AES-GCM encrypt/decrypt helpers
+def aes_gcm_encrypt(aes_key: bytes, plaintext: bytes):
+    iv = os.urandom(12)  # 96-bit nonce recommended for GCM
+    encryptor = Cipher(algorithms.AES(aes_key), modes.GCM(iv), backend=default_backend()).encryptor()
+    ct = encryptor.update(plaintext) + encryptor.finalize()
+    tag = encryptor.tag
+    return iv, ct, tag
+
+def aes_gcm_decrypt(aes_key: bytes, iv: bytes, ct: bytes, tag: bytes):
+    decryptor = Cipher(algorithms.AES(aes_key), modes.GCM(iv, tag), backend=default_backend()).decryptor()
+    pt = decryptor.update(ct) + decryptor.finalize()
+    return pt
+
+class ClientSession:
+    def __init__(self, conn, addr):
+        self.conn = conn
+        self.addr = addr
+        self.aes_key = None  # derived per-session
+        # ephemeral ECDH private key for the server side of this session
+        self.ec_private = None
+
+    def close(self):
         try:
-            self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self.server_socket.bind((self.host, self.port))
-            self.server_socket.listen(5)
-            print(f"[+] Server listening on {self.host}:{self.port}")
-            print("[*] Waiting for clients to connect...\n")
+            self.conn.close()
+        except:
+            pass
 
-            while True:
-                client_socket, client_addr = self.server_socket.accept()
-                print_separator(f"NEW CLIENT CONNECTED - {client_addr}")
+def handle_client(conn, addr):
+    sess = ClientSession(conn, addr)
+    try:
+        print(f"[+] Connection from {addr}")
 
-                thread = threading.Thread(
-                    target=self.handle_client, args=(client_socket, client_addr)
-                )
-                thread.daemon = True
-                thread.start()
+        # 1) Server creates ephemeral EC key pair and sends its public bytes
+        sess.ec_private = ec.generate_private_key(ec.SECP384R1(), default_backend())
+        server_pub = sess.ec_private.public_key().public_bytes(
+            encoding=serialization.Encoding.X962,
+            format=serialization.PublicFormat.UncompressedPoint
+        )
+        # send server pub length-prefixed
+        send_msg(conn, server_pub)
+        # 2) Receive client's ephemeral public key
+        client_pub_bytes = recv_msg(conn)
+        if client_pub_bytes is None:
+            print("[!] Handshake failed: no client public key")
+            return
 
-        except OSError as e:
-            print(f"[!] Server error: {e}")
-        finally:
-            self.shutdown()
+        # load client public key
+        client_pubkey = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP384R1(), client_pub_bytes)
 
-    def handle_client(self, client_socket, client_addr):
-        """Handle client registration and encrypted message routing"""
-        try:
-            # Step 1: Receive client's public key
-            client_public_key = client_socket.recv(4096)
-            self.clients[client_socket] = (client_addr, client_public_key)
-            print(f"[+] Registered {client_addr} with public key")
+        # 3) Compute shared secret and derive AES key (PFS)
+        shared_secret = sess.ec_private.exchange(ec.ECDH(), client_pubkey)
+        sess.aes_key = derive_aes_key(shared_secret)
+        print("[+] Ephemeral ECDH handshake complete — AES session key derived (PFS)")
 
-            # Step 2: Send all other clients' public keys
-            for sock, (addr, pubkey) in self.clients.items():
-                if sock != client_socket:
-                    client_socket.send(len(pubkey).to_bytes(4, 'big'))
-                    client_socket.send(pubkey)
+        # Acknowledge handshake
+        send_msg(conn, b'OK')
 
-            # Step 3: Notify others about the new client
-            for sock in self.clients:
-                if sock != client_socket:
-                    sock.send(b'NEW_CLIENT')
-                    sock.send(len(client_public_key).to_bytes(4, 'big'))
-                    sock.send(client_public_key)
+        # Now exchange encrypted messages: expect length-prefixed frames
+        while True:
+            raw = recv_msg(conn)
+            if raw is None:
+                break
+            # message format: iv (12) | tag (16) | ciphertext (rest)
+            if len(raw) < 28:
+                print("[!] Received malformed encrypted frame")
+                continue
+            iv = raw[:12]
+            tag = raw[12:28]
+            ct = raw[28:]
+            try:
+                pt = aes_gcm_decrypt(sess.aes_key, iv, ct, tag)
+                print(f"[{addr}] {pt.decode(errors='replace')}")
+                # Example: server can optionally reply (encrypt with same session key)
+                reply_text = f"Server ACK: received {len(pt)} bytes"
+                iv_r, ct_r, tag_r = aes_gcm_encrypt(sess.aes_key, reply_text.encode())
+                send_msg(conn, iv_r + tag_r + ct_r)
+            except Exception as e:
+                print(f"[!] Decrypt error for {addr}: {e}")
+                # do not reveal details to client
+                continue
 
-            # Step 4: Forward encrypted messages (server never decrypts)
-            while True:
-                length_bytes = client_socket.recv(4)
-                if not length_bytes:
-                    break
+    except Exception as e:
+        print(f"[!] Exception in client handler {addr}: {e}")
+    finally:
+        print(f"[-] Closing {addr}")
+        sess.close()
 
-                msg_len = int.from_bytes(length_bytes, 'big')
-                encrypted_message = client_socket.recv(msg_len)
-
-                # Relay message to all other clients
-                for sock in self.clients:
-                    if sock != client_socket:
-                        sock.send(length_bytes)
-                        sock.send(encrypted_message)
-
-        except Exception as e:
-            print(f"[!] Error handling {client_addr}: {e}")
-        finally:
-            print(f"[-] Disconnecting {client_addr}")
-            del self.clients[client_socket]
-            client_socket.close()
-
-    def shutdown(self):
-        """Shutdown the server"""
-        for c in self.clients.keys():
-            c.close()
-        if self.server_socket:
-            self.server_socket.close()
-        print("[+] Server shutdown complete")
+def main():
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind((HOST, PORT))
+    s.listen(8)
+    print(f"[+] ECDH-PFS VPN server listening on {HOST}:{PORT}")
+    try:
+        while True:
+            conn, addr = s.accept()
+            t = threading.Thread(target=handle_client, args=(conn, addr), daemon=True)
+            t.start()
+    except KeyboardInterrupt:
+        print("\n[+] Server shutting down")
+    finally:
+        s.close()
         sys.exit(0)
 
-
 if __name__ == "__main__":
-    print("""
-    ╔════════════════════════════════════════════════════════════╗
-    ║         VPN PROTOTYPE - END-TO-END ENCRYPTION SERVER       ║
-    ║   Routes Encrypted Packets Without Reading Their Content   ║
-    ╚════════════════════════════════════════════════════════════╝
-    """)
-    host = input("Enter host (press Enter for 0.0.0.0): ").strip() or "0.0.0.0"
-    port_input = input("Enter port (press Enter for 8000): ").strip()
-    port = int(port_input) if port_input else 8000
+    main()
 
-    server = VPNServer(host=host, port=port)
-    server.start()
 
