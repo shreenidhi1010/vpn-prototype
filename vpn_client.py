@@ -1,167 +1,145 @@
-import socket
-import threading
-import sys
-from crypto_utils import CryptoHandler, print_separator
+# vpn_client.py
+import socket, json, struct, base64, threading, sys, os
+from cryptography.hazmat.primitives.asymmetric import rsa, padding
+from cryptography.hazmat.primitives import serialization, hashes
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.backends import default_backend
 
+HOST = '127.0.0.1'
+PORT = 8000
 
-class VPNServer:
-    def __init__(self, host='0.0.0.0', port=8000):
-        self.host = host
-        self.port = port
-        self.server_socket = None
-        self.clients = []
-        
-    def start(self):
-        """Start the VPN server"""
-        print_separator("VPN SERVER STARTING")
-        
-        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        
-        try:
-            self.server_socket.bind((self.host, self.port))
-            self.server_socket.listen(5)
-            print(f"[+] Server listening on {self.host}:{self.port}")
-            print("[+] Waiting for client connections...")
-            print_separator()
-            
-            while True:
-                client_socket, client_address = self.server_socket.accept()
-                print(f"\n[+] New connection from {client_address}")
-                
-                client_thread = threading.Thread(
-                    target=self.handle_client,
-                    args=(client_socket, client_address)
-                )
-                client_thread.daemon = True
-                client_thread.start()
-                self.clients.append(client_socket)
-                
-        except KeyboardInterrupt:
-            print("\n[!] Server shutting down...")
-            self.shutdown()
-        except Exception as e:
-            print(f"[!] Server error: {e}")
-            self.shutdown()
-    
-    def handle_client(self, client_socket, client_address):
-        """Handle individual client connection"""
-        client_crypto = CryptoHandler()
-        
-        try:
-            print_separator(f"SECURE TUNNEL ESTABLISHMENT - {client_address}")
-            
-            client_crypto.generate_rsa_keys()
-            
-            client_public_key = client_socket.recv(4096)
-            client_crypto.load_peer_public_key(client_public_key)
-            print(f"[+] Received public key from {client_address}")
-            
-            server_public_key = client_crypto.get_public_key_bytes()
-            client_socket.send(server_public_key)
-            print(f"[+] Sent public key to {client_address}")
-            
-            aes_key = client_crypto.generate_aes_key()
-            encrypted_aes_key = client_crypto.encrypt_aes_key_with_rsa(aes_key)
-            
-            key_length = len(encrypted_aes_key).to_bytes(4, byteorder='big')
-            client_socket.send(key_length)
-            client_socket.send(encrypted_aes_key)
-            print(f"[+] Sent encrypted AES key to {client_address}")
-            
-            ack = client_socket.recv(1024)
-            if ack == b'ACK':
-                print("[+] Secure tunnel established successfully!")
-                print_separator()
-                print(f"\n[*] Ready to receive encrypted messages from {client_address}")
-                print("[*] Type your messages below (or 'quit' to disconnect):\n")
-                
-                receive_thread = threading.Thread(
-                    target=self.receive_messages,
-                    args=(client_socket, client_address, client_crypto)
-                )
-                receive_thread.daemon = True
-                receive_thread.start()
-                
-                self.send_messages(client_socket, client_address, client_crypto)
+def recv_msg(conn):
+    hdr = conn.recv(4)
+    if not hdr:
+        return None
+    length = struct.unpack('>I', hdr)[0]
+    data = b''
+    while len(data) < length:
+        chunk = conn.recv(length - len(data))
+        if not chunk:
+            break
+        data += chunk
+    return data
+
+def send_msg(conn, data_bytes):
+    conn.sendall(struct.pack('>I', len(data_bytes)) + data_bytes)
+
+class E2EEClient:
+    def __init__(self, client_id):
+        self.id = client_id
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.priv = rsa.generate_private_key(public_exponent=65537, key_size=2048, backend=default_backend())
+        self.pub = self.priv.public_key()
+        self.known_pubs = {}  # id -> public key object
+
+    def pub_pem_b64(self):
+        pem = self.pub.public_bytes(encoding=serialization.Encoding.PEM,
+                                    format=serialization.PublicFormat.SubjectPublicKeyInfo)
+        return base64.b64encode(pem).decode()
+
+    def start(self, host=HOST, port=PORT):
+        self.sock.connect((host, port))
+        reg = {"type":"register", "id": self.id, "pub_key": self.pub_pem_b64()}
+        send_msg(self.sock, json.dumps(reg).encode())
+        threading.Thread(target=self._recv_loop, daemon=True).start()
+
+    def _recv_loop(self):
+        while True:
+            raw = recv_msg(self.sock)
+            if raw is None:
+                break
+            msg = json.loads(raw.decode())
+            typ = msg.get('type')
+            if typ == 'registered':
+                print("[*] Registered with relay server.")
+            elif typ == 'list':
+                print("[*] Clients:", msg.get('clients'))
+            elif typ == 'pubkey':
+                other = msg['id']
+                pem_b64 = msg['pub_key']
+                pem = base64.b64decode(pem_b64)
+                pubk = serialization.load_pem_public_key(pem, backend=default_backend())
+                self.known_pubs[other] = pubk
+                print(f"[*] Got public key for {other}")
+            elif typ == 'deliver':
+                frm = msg['from']
+                payload_b64 = msg['payload']
+                inner = json.loads(base64.b64decode(payload_b64).decode())
+                enc_key = base64.b64decode(inner['enc_key'])
+                iv = base64.b64decode(inner['iv'])
+                tag = base64.b64decode(inner['tag'])
+                ct = base64.b64decode(inner['ciphertext'])
+                # decrypt AES key
+                aes_key = self.priv.decrypt(enc_key,
+                                           padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                                                        algorithm=hashes.SHA256(), label=None))
+                # AES-GCM decrypt
+                decryptor = Cipher(algorithms.AES(aes_key), modes.GCM(iv, tag), backend=default_backend()).decryptor()
+                plaintext = decryptor.update(ct) + decryptor.finalize()
+                print(f"\n[{frm}] {plaintext.decode()}\n[You] ", end='', flush=True)
+            elif typ == 'error':
+                print("[ERROR]", msg.get('error'))
+            elif typ == 'sent':
+                print("[*] Message forwarded by server.")
             else:
-                print("[!] Failed to establish secure tunnel")
-                client_socket.close()
-                
-        except Exception as e:
-            print(f"[!] Error handling client {client_address}: {e}")
-            client_socket.close()
-    
-    def receive_messages(self, client_socket, client_address, client_crypto):
-        """Receive and decrypt messages from client"""
-        while True:
-            try:
-                length_bytes = client_socket.recv(4)
-                if not length_bytes:
-                    break
-                    
-                message_length = int.from_bytes(length_bytes, byteorder='big')
-                encrypted_message = b''
-                
-                while len(encrypted_message) < message_length:
-                    chunk = client_socket.recv(min(4096, message_length - len(encrypted_message)))
-                    if not chunk:
-                        break
-                    encrypted_message += chunk
-                
-                if encrypted_message:
-                    decrypted_message = client_crypto.decrypt_message(encrypted_message)
-                    print(f"\n[Client {client_address}] {decrypted_message}")
-                    print("[Server] ", end='', flush=True)
-                    
-            except Exception as e:
-                print(f"\n[!] Error receiving message from {client_address}: {e}")
-                break
-    
-    def send_messages(self, client_socket, client_address, client_crypto):
-        """Send encrypted messages to client"""
-        while True:
-            try:
-                message = input(f"[Server to {client_address}] ")
-                
-                if message.lower() == 'quit':
-                    print(f"[!] Disconnecting from {client_address}...")
-                    client_socket.close()
-                    break
-                
-                if message:
-                    encrypted_message = client_crypto.encrypt_message(message)
-                    
-                    message_length = len(encrypted_message).to_bytes(4, byteorder='big')
-                    client_socket.send(message_length)
-                    client_socket.send(encrypted_message)
-                    
-            except Exception as e:
-                print(f"[!] Error sending message to {client_address}: {e}")
-                break
-    
-    def shutdown(self):
-        """Shutdown the server"""
-        for client in self.clients:
-            try:
-                client.close()
-            except:
-                pass
-        
-        if self.server_socket:
-            self.server_socket.close()
-        
-        print("[+] Server shutdown complete")
-        sys.exit(0)
+                print("[*] Unknown server msg:", msg)
 
+    def request_pub(self, other_id):
+        send_msg(self.sock, json.dumps({"type":"get_pub", "id": other_id}).encode())
+
+    def list_clients(self):
+        send_msg(self.sock, json.dumps({"type":"list"}).encode())
+
+    def send_to(self, to_id, plaintext):
+        if to_id not in self.known_pubs:
+            self.request_pub(to_id)
+            print("[*] Requested recipient public key. Try again after you receive it.")
+            return
+        recipient_pub = self.known_pubs[to_id]
+        aes_key = os.urandom(32)   # AES-256
+        iv = os.urandom(12)        # GCM nonce
+        encryptor = Cipher(algorithms.AES(aes_key), modes.GCM(iv), backend=default_backend()).encryptor()
+        ct = encryptor.update(plaintext.encode()) + encryptor.finalize()
+        tag = encryptor.tag
+        enc_key = recipient_pub.encrypt(aes_key,
+                                        padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                                                     algorithm=hashes.SHA256(), label=None))
+        inner = {
+            "enc_key": base64.b64encode(enc_key).decode(),
+            "iv": base64.b64encode(iv).decode(),
+            "tag": base64.b64encode(tag).decode(),
+            "ciphertext": base64.b64encode(ct).decode()
+        }
+        payload_b64 = base64.b64encode(json.dumps(inner).encode()).decode()
+        send_msg(self.sock, json.dumps({"type":"send","to": to_id, "from": self.id, "payload": payload_b64}).encode())
 
 if __name__ == "__main__":
-    print("""
-    ╔════════════════════════════════════════════════════════════╗
-    ║          VPN PROTOTYPE - SECURE TUNNEL SERVER              ║
-    ║    Demonstrating RSA Key Exchange & AES-256 Encryption     ║
-    ╚════════════════════════════════════════════════════════════╝
-    """)
-    
-    server = VPNServer()
-    server.start()
+    cid = input("Enter client id: ").strip()
+    c = E2EEClient(cid)
+    c.start()
+    print("Commands: /list, /get <id>, /send <id> <message>, /quit")
+    while True:
+        try:
+            cmd = input("[You] ").strip()
+            if not cmd:
+                continue
+            if cmd == "/list":
+                c.list_clients()
+            elif cmd.startswith("/get "):
+                _, other = cmd.split(maxsplit=1)
+                c.request_pub(other)
+            elif cmd.startswith("/send "):
+                parts = cmd.split(maxsplit=2)
+                if len(parts) < 3:
+                    print("Usage: /send <id> <message>")
+                    continue
+                _, to_id, msg = parts
+                c.send_to(to_id, msg)
+            elif cmd in ("/quit", "/exit"):
+                break
+            else:
+                print("Unknown command.")
+        except KeyboardInterrupt:
+            break
+    print("Exiting.")
+    sys.exit(0)
